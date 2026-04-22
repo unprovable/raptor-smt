@@ -252,7 +252,9 @@ Examples:
             git_safe = ["-c", "core.hooksPath=/dev/null",
                         "-c", "filter.lfs.clean=true",
                         "-c", "filter.lfs.smudge=true",
-                        "-c", "filter.lfs.process=true"]
+                        "-c", "filter.lfs.process=true",                   
+                        "-c", "user.name=raptor",                                
+                        "-c", "user.email=raptor@local"] 
             result = subprocess.run(
                 ["git"] + git_safe + ["init"], cwd=temp_repo,
                 capture_output=True, text=True, timeout=30, env=env
