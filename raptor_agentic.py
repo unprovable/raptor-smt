@@ -15,7 +15,6 @@ Complete end-to-end autonomous security testing:
 """
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -228,14 +227,26 @@ Examples:
     git_dir = repo_path / ".git"
     if not git_dir.exists():
         print(f"\n  No .git directory found in {repo_path}")
-        print(f"    Semgrep requires a git repository. Creating a temporary copy...")
+        print("    Semgrep requires a git repository. Creating a temporary copy...")
         logger.info(f"Target {repo_path} is not a git repo — creating temp copy")
 
         try:
+            import atexit
             import shutil
             import tempfile
             temp_dir = Path(tempfile.mkdtemp(prefix="raptor_git_"))
             _git_temp_dir = temp_dir
+            # atexit-register BEFORE any work that can sys.exit — otherwise the
+            # end-of-function rmtree (line ~1033) is bypassed on the sys.exit(1)
+            # paths in the except handlers below, leaking raptor_git_*/ under
+            # /tmp on every failed non-git target. atexit fires on sys.exit too.
+            def _cleanup_git_temp(p=temp_dir):
+                try:
+                    if p.exists():
+                        shutil.rmtree(str(p))
+                except Exception:
+                    pass
+            atexit.register(_cleanup_git_temp)
             temp_repo = temp_dir / repo_path.name
             # Copy symlinks as-is, don't follow them into files outside the repo
             shutil.copytree(str(repo_path), str(temp_repo), symlinks=True)
@@ -252,7 +263,9 @@ Examples:
             git_safe = ["-c", "core.hooksPath=/dev/null",
                         "-c", "filter.lfs.clean=true",
                         "-c", "filter.lfs.smudge=true",
-                        "-c", "filter.lfs.process=true"]
+                        "-c", "filter.lfs.process=true",                   
+                        "-c", "user.name=raptor",                                
+                        "-c", "user.email=raptor@local"] 
             result = subprocess.run(
                 ["git"] + git_safe + ["init"], cwd=temp_repo,
                 capture_output=True, text=True, timeout=30, env=env
@@ -275,11 +288,11 @@ Examples:
                 sys.exit(1)
 
         except subprocess.TimeoutExpired:
-            print(f"  Git initialization timed out")
+            print("  Git initialization timed out")
             logger.error("Git init timeout")
             sys.exit(1)
         except FileNotFoundError:
-            print(f"  Git is not installed. Please install git and try again.")
+            print("  Git is not installed. Please install git and try again.")
             logger.error("Git not found in PATH")
             sys.exit(1)
         except Exception as e:
@@ -416,7 +429,7 @@ Examples:
             "--repo", str(repo_path),
             "--policy_groups", args.policy_groups,
         ]
-        logger.info(f"Running: Scanning code with Semgrep")
+        logger.info("Running: Scanning code with Semgrep")
         semgrep_proc = subprocess.Popen(
             semgrep_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env=RaptorConfig.get_safe_env(),
@@ -440,7 +453,7 @@ Examples:
             codeql_cmd.append("--extended")
         if args.codeql_cli:
             codeql_cmd.extend(["--codeql-cli", args.codeql_cli])
-        logger.info(f"Running: Scanning code with CodeQL")
+        logger.info("Running: Scanning code with CodeQL")
         codeql_proc = subprocess.Popen(
             codeql_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env=RaptorConfig.get_safe_env(),
@@ -455,7 +468,7 @@ Examples:
             semgrep_proc.kill()
             semgrep_proc.communicate()
             rc = -1
-            print(f"❌ Semgrep scan timed out (30m)")
+            print("❌ Semgrep scan timed out (30m)")
             logger.error("Semgrep scan timed out")
             if not run_codeql:
                 sys.exit(1)
@@ -472,7 +485,7 @@ Examples:
                 if scan_metrics_file.exists():
                     semgrep_metrics = load_json(scan_metrics_file)
 
-                    print(f"\n✓ Semgrep scan complete:")
+                    print("\n✓ Semgrep scan complete:")
                     print(f"  - Files scanned: {semgrep_metrics.get('total_files_scanned', 0)}")
                     print(f"  - Findings: {semgrep_metrics.get('total_findings', 0)}")
                     print(f"  - Critical: {semgrep_metrics.get('findings_by_severity', {}).get('error', 0)}")
@@ -498,14 +511,14 @@ Examples:
             codeql_proc.kill()
             codeql_proc.communicate()
             rc = -1
-            print(f"❌ CodeQL scan timed out (30m)")
+            print("❌ CodeQL scan timed out (30m)")
             logger.error("CodeQL scan timed out")
 
         if rc != 0:
             if all_sarif_files:
-                print(f"⚠️  CodeQL scan failed — continuing with existing findings")
+                print("⚠️  CodeQL scan failed — continuing with existing findings")
             else:
-                print(f"⚠️  CodeQL scan failed — no findings from any scanner")
+                print("⚠️  CodeQL scan failed — no findings from any scanner")
             logger.warning(f"CodeQL scan failed - rc={rc}")
             if args.codeql_only:
                 print("❌ CodeQL-only mode failed")
@@ -520,7 +533,7 @@ Examples:
                 total_findings = codeql_metrics.get('total_findings', 0)
                 sarif_files = codeql_metrics.get('sarif_files', [])
 
-                print(f"\n✓ CodeQL scan complete:")
+                print("\n✓ CodeQL scan complete:")
                 print(f"  - Languages: {', '.join(codeql_metrics.get('languages_detected', {}).keys())}")
                 print(f"  - Findings: {total_findings}")
                 print(f"  - SARIF files: {len(sarif_files)}")
@@ -633,7 +646,7 @@ Examples:
             if analysis.get('mode') == 'prep_only':
                 print(f"\n✓ {analysis.get('processed', 0)} findings prepared for analysis")
             else:
-                print(f"\n✓ Analysis complete:")
+                print("\n✓ Analysis complete:")
                 print(f"  - Analysed: {analysis.get('analyzed', 0)}")
                 print(f"  - Exploitable: {analysis.get('exploitable', 0)}")
                 print(f"  - Exploits generated: {analysis.get('exploits_generated', 0)}")
@@ -642,7 +655,7 @@ Examples:
                 if args.codeql or args.codeql_only:
                     print(f"  - CodeQL dataflow paths validated: {analysis.get('dataflow_validated', 0)}")
         else:
-            print(f"⚠️  Analysis failed or produced no output")
+            print("⚠️  Analysis failed or produced no output")
             if stderr:
                 print(f"    Error: {stderr[:500]}")
             logger.warning(f"Phase 3 failed - rc={rc}, stderr={stderr[:200]}")
@@ -891,7 +904,7 @@ Examples:
                 for model, mcost in by_model.items():
                     print(f"     {model}: ${mcost:.2f}")
 
-    print(f"\n📁 Outputs:")
+    print("\n📁 Outputs:")
     print(f"   Main report: {report_file}")
     if mitigation_result:
         print(f"   Exploit feasibility: {out_dir / 'exploit_feasibility.txt'}")

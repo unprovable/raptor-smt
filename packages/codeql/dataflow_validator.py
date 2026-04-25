@@ -10,7 +10,14 @@ import json
 import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+from core.smt_solver import BVProfile
+from packages.codeql.smt_path_validator import (
+    PathCondition,
+    PathSMTResult,
+    check_path_feasibility,
+)
 
 # Add parent directory to path for imports
 # packages/codeql/dataflow_validator.py -> repo root
@@ -55,6 +62,47 @@ class DataflowValidation:
     barriers: List[str]
     prerequisites: List[str]
 
+
+PATH_CONDITIONS_SCHEMA = {
+    "path_width": "int (32 or 64) — bitvector width; see prompt for when to pick",
+    "path_signed": "boolean — signedness; see prompt for guidance",
+    "path_conditions": "list of {step_index: int, condition: str, negated: bool}",
+    "unparseable": "list of strings — conditions too complex to express as simple predicates",
+}
+
+# Rule-id substrings that indicate a 32-bit integer-overflow reasoning mode.
+# Case-insensitive match; the list covers common CodeQL rule naming.
+_OVERFLOW_MARKERS = (
+    "cwe-190", "cwe-191", "cwe-680", "cwe-197",
+    "overflow", "underflow", "wraparound", "wrap-around",
+    "intoverflow", "integeroverflow", "integer-overflow",
+)
+
+
+def _infer_bv_profile(rule_id: Optional[str], llm_hint: Dict) -> BVProfile:
+    """Build a BVProfile from the LLM's per-path hint, falling back to a
+    rule-id heuristic when the hint is missing or invalid.
+
+    Priority:
+      1. ``llm_hint['width']`` / ``llm_hint['signed']`` when present and valid
+      2. Rule-id heuristic: CWE-190-family → 32-bit unsigned, otherwise
+         64-bit unsigned
+
+    Any partial hint (e.g. width only) takes the LLM's value for the
+    supplied field and fills the missing one from the heuristic default.
+    """
+    rule_lc = (rule_id or "").lower()
+    heuristic_width = 32 if any(m in rule_lc for m in _OVERFLOW_MARKERS) else 64
+    heuristic_signed = False  # unsigned is correct for most path conditions
+
+    # Accept only sensible LLM-emitted values; ignore anything else.
+    raw_width = llm_hint.get("width")
+    width = raw_width if isinstance(raw_width, int) and raw_width > 0 else heuristic_width
+
+    raw_signed = llm_hint.get("signed")
+    signed = raw_signed if isinstance(raw_signed, bool) else heuristic_signed
+
+    return BVProfile(width=width, signed=signed)
 
 # Dict schema for LLM structured generation (consistent with other callers)
 DATAFLOW_VALIDATION_SCHEMA = {
@@ -188,6 +236,84 @@ class DataflowValidator:
             self.logger.warning(f"Failed to read source context: {e}")
             return ""
 
+    def _extract_path_conditions(
+        self,
+        dataflow: DataflowPath,
+        repo_path: Path,
+    ) -> Tuple[List[PathCondition], Dict]:
+        """Ask the LLM to extract branch conditions + bitvector type hint.
+
+        Returns ``(conditions, hint)`` where ``hint`` is a dict with
+        optional ``'width'`` and ``'signed'`` keys — ``_infer_bv_profile``
+        combines these with the rule-id heuristic to pick a BVProfile.
+        Failures are non-fatal — an empty list causes SMT to return
+        feasible=True and the full LLM validation still runs.
+        """
+        path_summary = []
+        for i, step in enumerate([dataflow.source] + dataflow.intermediate_steps + [dataflow.sink]):
+            ctx = self.read_source_context(str(repo_path / step.file_path), step.line, context_lines=5)
+            path_summary.append(f"STEP {i} ({step.label}) — {step.file_path}:{step.line}\n{ctx}")
+
+        prompt = f"""You are analysing a CodeQL dataflow path for exploitability.
+
+RULE: {dataflow.rule_id}
+MESSAGE: {dataflow.message}
+
+DATAFLOW STEPS:
+{chr(10).join(path_summary)}
+
+Extract every branch condition or guard that must hold for execution to
+reach the sink. Express each as a simple predicate over named variables,
+for example:
+  "size > 0", "offset + length <= buffer_size", "ptr != NULL",
+  "flags & 0x80000000 == 0"
+
+Also emit two per-path type hints so SMT uses the correct bitvector
+semantics:
+  - path_width: 32 when the dominant variables are C `int`/`unsigned int`
+    (CWE-190 32-bit wraparound lives here); 64 for `size_t`/`uint64_t`.
+  - path_signed: true if variables are signed ints (`int`, `int32_t`) and
+    you want overflow reasoning that matches C's UB semantics; false for
+    unsigned / pointer arithmetic.  Default false.
+
+Set negated=true on a condition if it must be FALSE for the path to
+proceed (i.e. a check that was bypassed).
+
+Respond in JSON:
+{{
+  "path_width": 32,
+  "path_signed": false,
+  "path_conditions": [
+    {{"step_index": 0, "condition": "size > 0", "negated": false}},
+    ...
+  ],
+  "unparseable": ["any condition too complex to express as a simple predicate"]
+}}
+"""
+        try:
+            response, _ = self.llm.generate_structured(
+                prompt=prompt,
+                schema=PATH_CONDITIONS_SCHEMA,
+                system_prompt="You are an expert security researcher extracting path conditions from code.",
+            )
+            conditions = [
+                PathCondition(
+                    text=c.get("condition", ""),
+                    step_index=c.get("step_index", 0),
+                    negated=bool(c.get("negated", False)),
+                )
+                for c in response.get("path_conditions", [])
+                if c.get("condition")
+            ]
+            hint = {
+                "width": response.get("path_width"),
+                "signed": response.get("path_signed"),
+            }
+            return conditions, hint
+        except Exception as e:
+            self.logger.debug(f"Path condition extraction failed: {e}")
+            return [], {}
+
     def validate_dataflow_path(
         self,
         dataflow: DataflowPath,
@@ -204,6 +330,41 @@ class DataflowValidator:
             DataflowValidation result
         """
         self.logger.info(f"Validating dataflow path: {dataflow.rule_id}")
+
+        # SMT pre-check: extract path conditions (plus a bitvector type
+        # hint from the LLM) and test joint satisfiability.  If unsat,
+        # the path is provably unreachable — skip the expensive LLM call.
+        conditions, profile_hint = self._extract_path_conditions(dataflow, repo_path)
+        profile = _infer_bv_profile(dataflow.rule_id, profile_hint)
+        smt_result = check_path_feasibility(conditions, profile=profile)
+
+        if smt_result.feasible is False:
+            self.logger.info(
+                f"SMT: path infeasible — {smt_result.reasoning}"
+            )
+            return DataflowValidation(
+                is_exploitable=False,
+                confidence=0.7,  # Some confidence since SMT is a strong signal, but not perfect
+                sanitizers_effective=True,
+                bypass_possible=False,
+                bypass_strategy=None,
+                attack_complexity="high",
+                reasoning=(
+                    f"SMT analysis: {smt_result.reasoning}. Path conditions are mutually exclusive. "
+                    "Confidence is capped at 0.7 because this formal verdict depends on "
+                    "LLM-extracted predicates which may have parsing or coverage limitations."
+                ),
+                barriers=smt_result.unsatisfied,
+                prerequisites=[],
+            )
+
+        # Path is sat or indeterminate — run full LLM analysis.
+        # Pass the SMT model (concrete variable values) as 
+        # candidate inputs. Skip if no Z3.
+        smt_hint = (
+            f"\nSMT pre-analysis: {smt_result.reasoning}"
+            + (f"\nCandidate input values: {smt_result.model}" if smt_result.model else "")
+        ) if smt_result.smt_available else ""
 
         # Read source context for key locations
         source_context = self.read_source_context(
@@ -249,7 +410,7 @@ Line: {dataflow.sink.line}
 
 {sink_context}
 
-SANITIZERS DETECTED: {', '.join(dataflow.sanitizers) if dataflow.sanitizers else 'None'}
+SANITIZERS DETECTED: {', '.join(dataflow.sanitizers) if dataflow.sanitizers else 'None'}{smt_hint}
 
 Analyze this dataflow path and determine:
 
