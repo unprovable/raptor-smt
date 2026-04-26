@@ -258,7 +258,13 @@ class TestGetOutDir:
         with patch.dict(os.environ, {"RAPTOR_OUT_DIR": str(tmp_path)}):
             assert get_out_dir() == tmp_path.resolve()
 
-    def test_defaults_to_out(self):
-        env = {k: v for k, v in os.environ.items() if k != "RAPTOR_OUT_DIR"}
-        with patch.dict(os.environ, env, clear=True):
-            assert get_out_dir().name == "out"
+    def test_defaults_to_out(self, monkeypatch):
+        # See test_recon_agent.py:test_defaults_to_out_subdirectory for
+        # the full explanation — short version: a prior test left CWD
+        # dangling, ``monkeypatch.chdir`` calls ``os.getcwd`` which
+        # fails on a dangling CWD, so we use plain ``os.chdir`` to a
+        # path derived from ``__file__`` (which doesn't depend on CWD).
+        repo_root = Path(__file__).resolve().parents[3]
+        os.chdir(repo_root)
+        monkeypatch.delenv("RAPTOR_OUT_DIR", raising=False)
+        assert get_out_dir().name == "out"

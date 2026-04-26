@@ -103,11 +103,18 @@ class TestGetOutDir:
             result = get_out_dir()
             assert result == tmp_path.resolve()
 
-    def test_defaults_to_out_subdirectory(self):
-        env_without = {k: v for k, v in os.environ.items() if k != "RAPTOR_OUT_DIR"}
-        with patch.dict(os.environ, env_without, clear=True):
-            result = get_out_dir()
-            assert result.name == "out"
+    def test_defaults_to_out_subdirectory(self, monkeypatch):
+        # Repair a dangling CWD left by an earlier test that chdir'd into
+        # a cleaned-up tmp_path. We can't use ``monkeypatch.chdir()`` for
+        # this — its first action is ``os.getcwd()`` to remember the
+        # current cwd for restoration, which fails when cwd is already
+        # gone. Plain ``os.chdir()`` doesn't introspect the current cwd,
+        # so it works regardless. ``Path(__file__).resolve()`` doesn't
+        # depend on cwd, so we can safely derive the repo root here.
+        repo_root = Path(__file__).resolve().parents[3]
+        os.chdir(repo_root)
+        monkeypatch.delenv("RAPTOR_OUT_DIR", raising=False)
+        assert get_out_dir().name == "out"
 
     def test_returns_path_object(self, tmp_path):
         with patch.dict(os.environ, {"RAPTOR_OUT_DIR": str(tmp_path)}):
